@@ -9,7 +9,7 @@ on:
 
 jobs:
   build-ios:
-    name: Build iOS
+    name: Build iOS (device)
     runs-on: macos-latest  # macOS 15 ARM64, Xcode 16
 
     steps:
@@ -90,10 +90,8 @@ jobs:
         working-directory: shared
         run: yarn install --pure-lockfile --ignore-optional --ignore-scripts
 
-      # Node 20 babel shim — same approach as Windows build.
-      # Hooks Module._extensions for .tsx/.ts to pre-transpile to CommonJS
-      # before Node 20's importSyncForRequire ESM detector fires.
-      # node_modules/.bin on PATH so tools like patch-package resolve correctly.
+      # Node 20 babel shim — hooks Module._extensions for .tsx/.ts to
+      # pre-transpile to CommonJS. node_modules/.bin on PATH for patch-package etc.
       - name: Write babel shim
         working-directory: shared
         run: |
@@ -128,47 +126,94 @@ jobs:
           node yarn-runner.js postinstall
 
       # ── CocoaPods ─────────────────────────────────────────────────────────
-      # --repo-update ensures the spec repo is fresh on a cold runner.
-      # Node must already be on PATH (it is — setup-node ran earlier).
       - name: Install CocoaPods
         working-directory: shared/ios
         run: pod install --repo-update
 
-      # ── Xcode build (simulator, unsigned) ─────────────────────────────────
-      # iPhone 16 is the correct simulator for Xcode 16 on macos-15.
-      # OS version omitted — Xcode picks the latest installed runtime automatically.
-      # CODE_SIGNING_ALLOWED=NO skips all signing for simulator builds.
-      - name: Build (simulator, unsigned)
+      # ── Import signing certificate & provisioning profile ─────────────────
+      # Certificate: exported from Keychain as .p12, base64-encoded
+      # Profile: wildcard .mobileprovision, base64-encoded
+      # Both stored as GitHub Actions secrets.
+      - name: Import signing certificate
+        env:
+          CERTIFICATE_P12: ${{ secrets.SIGNING_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+          # Create a temporary keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          # Import certificate
+          echo "$CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/xcodebuild
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+      - name: Install provisioning profile
+        env:
+          PROVISIONING_PROFILE: ${{ secrets.PROVISIONING_PROFILE }}
+        run: |
+          PP_PATH="$RUNNER_TEMP/profile.mobileprovision"
+          echo "$PROVISIONING_PROFILE" | base64 --decode > "$PP_PATH"
+          # Extract UUID and install
+          UUID=$(security cms -D -i "$PP_PATH" \
+            | plutil -extract UUID raw -)
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp "$PP_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/"$UUID".mobileprovision
+          echo "PROVISIONING_PROFILE_UUID=$UUID" >> $GITHUB_ENV
+
+      # ── Xcode build (device, signed) ───────────────────────────────────────
+      # Builds for generic/platform=iOS (real device, arm64).
+      # Uses the imported wildcard cert + provisioning profile.
+      - name: Build (device, signed)
         working-directory: shared/ios
         run: |
           xcodebuild \
             -workspace Keybase.xcworkspace \
             -scheme Keybase \
-            -configuration Debug \
-            -destination 'platform=iOS Simulator,name=iPhone 16' \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
             -derivedDataPath ~/DerivedData \
-            CODE_SIGNING_ALLOWED=NO
+            PROVISIONING_PROFILE_SPECIFIER="$PROVISIONING_PROFILE_UUID" \
+            CODE_SIGN_STYLE=Manual \
+            -allowProvisioningUpdates
 
-      # ── Upload artifact ────────────────────────────────────────────────────
-      - name: Upload .app artifact (simulator)
+      # ── Package IPA ────────────────────────────────────────────────────────
+      - name: Package IPA
+        run: |
+          mkdir -p /tmp/ipa/Payload
+          cp -r ~/DerivedData/Build/Products/Release-iphoneos/Keybase.app \
+            /tmp/ipa/Payload/
+          cd /tmp/ipa
+          zip -r Keybase.ipa Payload/
+          echo "IPA_PATH=/tmp/ipa/Keybase.ipa" >> $GITHUB_ENV
+
+      # ── Upload IPA artifact ────────────────────────────────────────────────
+      - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Keybase-iOS-Simulator
-          path: ~/DerivedData/Build/Products/Debug-iphonesimulator/Keybase.app
-          if-no-files-found: warn
+          name: Keybase-iOS-Device
+          path: /tmp/ipa/Keybase.ipa
+          if-no-files-found: error
           retention-days: 14
 
-      # ── Signed IPA (disabled until signing is configured) ─────────────────
-      # To enable: add these secrets in repo settings:
+      # ── TestFlight (disabled until App Store Connect is configured) ────────
+      # Remove the `if: ${{ false }}` and add secrets to enable:
       #   APP_STORE_CONNECT_KEY_ID, APP_STORE_CONNECT_ISSUER_ID,
-      #   APP_STORE_CONNECT_KEY (base64-encoded .p8), MATCH_PASSWORD
-      # Then remove the `if: ${{ false }}` condition.
-      - name: Build signed IPA (TestFlight)
+      #   APP_STORE_CONNECT_KEY (base64-encoded .p8)
+      - name: Upload to TestFlight
         if: ${{ false }}
         working-directory: shared/ios
         env:
           APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
           APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
           APP_STORE_CONNECT_KEY: ${{ secrets.APP_STORE_CONNECT_KEY }}
-          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
         run: bundle exec fastlane beta
